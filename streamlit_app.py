@@ -70,8 +70,8 @@ class BrowserController:
         except Exception as e:
             return f"❌ Failed to start browser: {str(e)}"
 
-    async def _async_execute_command(self, command: str, api_key: str) -> str:
-        """Execute a browser command using Claude to interpret it (async)"""
+    async def _async_execute_goal(self, goal: str, api_key: str, progress_callback=None) -> str:
+        """Execute a high-level goal autonomously with multiple steps"""
         if not self.is_running:
             return "❌ Browser not started. Please enter a URL first!"
 
@@ -80,13 +80,118 @@ class BrowserController:
             if not api_key or not api_key.strip():
                 return "❌ API key is missing. Please enter it in the sidebar."
 
-            # Debug: print first 15 chars of API key
-            print(f"DEBUG: Using API key: {api_key[:15]}...")
-            print(f"DEBUG: API key length: {len(api_key)}")
-
-            # Use OpenAI to interpret the command
             client = OpenAI(api_key=api_key.strip())
-            print(f"DEBUG: OpenAI client created successfully")
+
+            if progress_callback:
+                progress_callback("🤖 Agent started. Analyzing goal...")
+
+            # Get current page state
+            page_content = await self.page.text_content("body")
+            page_url = self.page.url
+            page_title = await self.page.title()
+
+            # Agent conversation history
+            conversation = []
+            max_steps = 15  # Prevent infinite loops
+            step_count = 0
+
+            while step_count < max_steps:
+                step_count += 1
+
+                if progress_callback:
+                    progress_callback(f"🔄 Step {step_count}: Planning next action...")
+
+                # Build the agent prompt
+                system_prompt = """You are an autonomous web browser agent. You can:
+1. Navigate to URLs
+2. Click elements (provide CSS selector)
+3. Fill forms (provide CSS selector and value)
+4. Scroll pages (up/down with pixel amounts)
+5. Get page content
+
+Analyze the goal and current page state. Decide the NEXT SINGLE action to take.
+If the goal is complete, respond with {"status": "complete", "summary": "what was accomplished"}
+Otherwise, respond with ONE action in this format:
+{"action": "navigate|click|fill|scroll|get_content", "selector": "css_selector_if_needed", "value": "value_if_needed", "url": "url_if_navigate", "reasoning": "why this action"}"""
+
+                # Create the planning message
+                planning_message = f"""GOAL: {goal}
+
+CURRENT STATE:
+- URL: {page_url}
+- Page Title: {page_title}
+- Page Content (first 2000 chars): {page_content[:2000]}
+
+STEPS TAKEN SO FAR: {step_count - 1}
+{chr(10).join([f"- {msg['content']}" for msg in conversation[-3:]])}
+
+What is the NEXT action to achieve the goal? Respond with JSON only."""
+
+                conversation.append({"role": "user", "content": planning_message})
+
+                # Ask GPT to plan next action
+                response = client.chat.completions.create(
+                    model="gpt-4",
+                    max_tokens=1024,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        *conversation
+                    ]
+                )
+
+                # Parse response
+                import json
+                response_text = response.choices[0].message.content.strip()
+
+                # Remove markdown code blocks if present
+                if response_text.startswith('```'):
+                    lines = response_text.split('\n')
+                    response_text = '\n'.join(lines[1:-1])
+
+                decision = json.loads(response_text)
+                conversation.append({"role": "assistant", "content": response_text})
+
+                # Check if goal is complete
+                if decision.get("status") == "complete":
+                    if progress_callback:
+                        progress_callback(f"✅ Goal complete: {decision.get('summary', 'Task finished')}")
+                    return f"✅ **Goal Complete!**\n\n{decision.get('summary', 'Task finished successfully')}\n\n**Steps taken:** {step_count}"
+
+                # Execute the action
+                action_desc = decision.get('reasoning', 'Executing action')
+                if progress_callback:
+                    progress_callback(f"⚙️ {action_desc}")
+
+                result = await self._async_execute_action(decision)
+
+                if progress_callback:
+                    progress_callback(f"✓ {result}")
+
+                # Update page state for next iteration
+                await asyncio.sleep(1)  # Brief pause for page to update
+                page_content = await self.page.text_content("body")
+                page_url = self.page.url
+                page_title = await self.page.title()
+
+                # Add result to conversation
+                conversation.append({"role": "user", "content": f"Action result: {result}"})
+
+            return f"⚠️ **Goal partially complete** - Reached maximum {max_steps} steps.\n\nThe agent may need more steps or the goal might need to be simplified."
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    async def _async_execute_command(self, command: str, api_key: str) -> str:
+        """Execute a single browser command (legacy support)"""
+        if not self.is_running:
+            return "❌ Browser not started. Please enter a URL first!"
+
+        try:
+            # Validate API key
+            if not api_key or not api_key.strip():
+                return "❌ API key is missing. Please enter it in the sidebar."
+
+            client = OpenAI(api_key=api_key.strip())
 
             # Ask GPT to convert natural language to specific browser actions
             response = client.chat.completions.create(
@@ -133,10 +238,44 @@ Respond with ONLY the JSON, nothing else."""
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
-    def execute_command(self, command: str, api_key: str) -> str:
-        """Execute command using dedicated event loop"""
+    def execute_goal(self, goal: str, api_key: str, progress_callback=None) -> str:
+        """Execute autonomous goal using dedicated event loop"""
         try:
-            return self._run_async(self._async_execute_command(command, api_key))
+            # Wrapper for progress callback to work with threading
+            def thread_safe_callback(msg):
+                if progress_callback:
+                    progress_callback(msg)
+
+            async def run_with_callback():
+                return await self._async_execute_goal(goal, api_key, thread_safe_callback)
+
+            return self._run_async(run_with_callback())
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def execute_command(self, command: str, api_key: str, mode: str = "auto") -> str:
+        """Execute command or goal based on mode
+
+        mode: 'command' (single action), 'goal' (autonomous), 'auto' (detect)
+        """
+        try:
+            if mode == "auto":
+                # Detect if this is a multi-step goal vs single command
+                goal_indicators = [
+                    "and then", "after that", "find", "search for", "get the",
+                    "compare", "collect", "list", "save", "download"
+                ]
+                is_goal = any(indicator in command.lower() for indicator in goal_indicators)
+
+                if is_goal or len(command.split()) > 10:
+                    mode = "goal"
+                else:
+                    mode = "command"
+
+            if mode == "goal":
+                return self.execute_goal(command, api_key)
+            else:
+                return self._run_async(self._async_execute_command(command, api_key))
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
@@ -301,25 +440,47 @@ with st.sidebar:
 
     st.divider()
 
+    # Agent Mode Selection
+    st.header("🤖 Agent Mode")
+    agent_mode = st.radio(
+        "Select mode:",
+        options=["auto", "command", "goal"],
+        index=0,
+        help="Auto: detects if input is command or goal\nCommand: single action\nGoal: autonomous multi-step"
+    )
+
+    if 'agent_mode' not in st.session_state:
+        st.session_state.agent_mode = "auto"
+    st.session_state.agent_mode = agent_mode
+
+    if agent_mode == "command":
+        st.info("💬 **Command Mode**: Each input = one action")
+    elif agent_mode == "goal":
+        st.info("🎯 **Goal Mode**: Agent works autonomously until goal complete")
+    else:
+        st.info("🔮 **Auto Mode**: Automatically detects command vs goal")
+
+    st.divider()
+
     # Example commands
-    st.header("💡 Example Commands")
-    st.markdown("""
-    - **Navigation:**
-      - go to reddit.com
-      - navigate to news.ycombinator.com
+    st.header("💡 Examples")
 
-    - **Interaction:**
-      - click the search button
-      - scroll down
-      - scroll up 300px
+    with st.expander("🔹 Simple Commands (1 action)"):
+        st.markdown("""
+        - go to reddit.com
+        - click the search button
+        - scroll down
+        - fill the search box with "claude"
+        """)
 
-    - **Forms:**
-      - fill the search box with "claude"
-      - type "hello" in the input field
+    with st.expander("🎯 Complex Goals (multi-step)"):
+        st.markdown("""
+        - Go to GitHub and search for "playwright python"
+        - Find the most popular Python web frameworks and list them
+        - Navigate to news.ycombinator.com and get the top 3 story titles
+        - Go to Reddit, search for "AI agents", and click the first result
+        """)
 
-    - **Content:**
-      - get the page content
-    """)
 
     st.divider()
 
@@ -330,7 +491,16 @@ with st.sidebar:
         st.rerun()
 
 # Main content area - Chat interface
-st.header("💬 Command Interface")
+mode = st.session_state.get('agent_mode', 'auto')
+if mode == "goal":
+    st.header("🎯 Autonomous Agent Interface")
+    st.caption("Give the agent a high-level goal and watch it work autonomously")
+elif mode == "command":
+    st.header("💬 Command Interface")
+    st.caption("Execute single browser actions")
+else:
+    st.header("🔮 Smart Interface")
+    st.caption("Automatically detects if you want a command or autonomous goal")
 
 # Display chat history
 for msg in st.session_state.messages:
@@ -338,13 +508,20 @@ for msg in st.session_state.messages:
     with st.chat_message(role):
         st.markdown(msg["content"])
 
-# Command input
-if prompt := st.chat_input("Enter a browser command...", key="command_input"):
-    # Get API key from session state
+# Command input with dynamic placeholder
+placeholder_text = {
+    "command": "Enter a single command (e.g., 'scroll down')...",
+    "goal": "Enter a goal (e.g., 'Find the top 3 Python repos on GitHub')...",
+    "auto": "Enter a command or goal..."
+}
+
+if prompt := st.chat_input(placeholder_text.get(mode, "Enter a command..."), key="command_input"):
+    # Get API key and mode from session state
     current_api_key = st.session_state.get('api_key', '')
+    current_mode = st.session_state.get('agent_mode', 'auto')
 
     if not current_api_key:
-        st.error("⚠️ Please enter your Anthropic API key in the sidebar")
+        st.error("⚠️ Please enter your OpenAI API key in the sidebar")
     elif not st.session_state.browser.is_running:
         st.error("⚠️ Please launch the browser first using the sidebar")
     else:
@@ -353,19 +530,43 @@ if prompt := st.chat_input("Enter a browser command...", key="command_input"):
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Execute command with agent
+        # Execute with progress tracking
         with st.chat_message("assistant"):
-            with st.spinner("🤖 Executing command..."):
-                # Pass API key from session state
-                result = st.session_state.browser.execute_command(prompt, current_api_key)
-                st.markdown(result)
-                st.session_state.messages.append({"role": "assistant", "content": result})
+            # Create a placeholder for progress updates
+            progress_placeholder = st.empty()
+            result_placeholder = st.empty()
+
+            progress_messages = []
+
+            def update_progress(msg):
+                progress_messages.append(msg)
+                progress_placeholder.markdown("\n\n".join(progress_messages))
+
+            # Execute based on mode
+            if current_mode == "goal":
+                update_progress("🤖 **Agent Mode: Autonomous Goal Execution**")
+                result = st.session_state.browser.execute_goal(prompt, current_api_key, update_progress)
+            else:
+                # Auto or command mode
+                result = st.session_state.browser.execute_command(prompt, current_api_key, current_mode)
+
+            # Clear progress and show final result
+            progress_placeholder.empty()
+            result_placeholder.markdown(result)
+            st.session_state.messages.append({"role": "assistant", "content": result})
 
 # Footer
 st.divider()
-st.markdown("""
+
+mode_help = {
+    "command": "Each input executes ONE action in the browser. You control every step.",
+    "goal": "Give a high-level goal. The agent plans and executes multiple steps autonomously.",
+    "auto": "Smart mode: Simple inputs = single command. Complex inputs = autonomous goal."
+}
+
+st.markdown(f"""
 <div style='text-align: center; color: gray; padding: 10px;'>
-    <strong>How it works:</strong> Enter a URL in the sidebar → Click "Open Browser" →
-    A Chrome window opens → Type commands below → Watch them execute live!
+    <strong>Current Mode: {mode.upper()}</strong><br>
+    {mode_help.get(mode, "")}
 </div>
 """, unsafe_allow_html=True)
